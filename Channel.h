@@ -12,6 +12,7 @@
 #include <boost/thread.hpp>
 #include <boost/function.hpp>
 #include <boost/bind.hpp>
+#include <boost/random.hpp>
 
 class GoRoutineMgr;
 
@@ -65,20 +66,21 @@ public:
 
 private:
 
-	GoRoutine* start(const GoRoutine::Go_Routine_Func&);
-	void add(const GoRoutine::Go_Routine_Func&);
-	GoRoutine* create(const GoRoutine::Go_Routine_Func& fn,bool newFiber);
+	static GoRoutineMgr* createInstance();
+	void createRoutine(const GoRoutine::Go_Routine_Func& fn);
+
+	GoRoutineMgr();
+	~GoRoutineMgr();
+	void scheduleproc();
 
 	void remove(GoRoutine* pToErase);
-	void deleteMe();
-	GoRoutine* randomSwitch();
+	GoRoutine* randomSwitch(boost::random::mt19937& random_engine);
 
 	std::list<GoRoutine*> m_listRoutine;			// 本管理器管理的去程列表
 	boost::mutex m_mtxList;
 
-	static std::vector<GoRoutineMgr*> s_vecManager;	// 所有的去程管理器
-	static uint32_t s_nxtManager;					// 用于负载均衡: 创建新去程的时候使用哪个去程管理器
-	static uint32_t s_maxManager;					// 最多可以用多少个线程来执行去程
+	GoRoutine* m_toErase;
+	void* m_fiber_addr;
 };
 
 //--------------------------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 
 #include "Channel.h"
 #include <stdio.h>
-#include <boost/random.hpp>
+
 
 static void gomain();
 
@@ -42,6 +42,7 @@ static void gomain(){
 
 	for(int idx = 0; idx < 5; ++idx){
 		pChnl->read(val,op_ok);
+		//pChnl->write(val,op_ok);
 		printf("== 取得随机值: %d\n\n",val);
 	}
 

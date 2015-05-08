@@ -1,108 +1,106 @@
 
 #include "Channel.h"
-#include <boost/random.hpp>
 
-boost::mutex s_mtxManager;
-std::vector<GoRoutineMgr*> GoRoutineMgr::s_vecManager;
-uint32_t GoRoutineMgr::s_maxManager = 1;
-uint32_t GoRoutineMgr::s_nxtManager = 0;
-
-void GoRoutineMgr::setGOMAXPROCS(uint32_t maxCnt){
-	boost::unique_lock<boost::mutex> lock(s_mtxManager);
-	if (maxCnt > 0){
-		uint32_t prev = s_maxManager;
-		s_maxManager = maxCnt;
-		if ((s_maxManager < prev) && (s_nxtManager > s_maxManager - 1)){
-			s_nxtManager = s_maxManager - 1;
-		}
-	}
-}
+static boost::mutex s_mtxManager;
+static GoRoutineMgr *s_pManager = 0;
 
 void GoRoutineMgr::go(GoRoutine::Go_Routine_Func fn){
-
-	boost::unique_lock<boost::mutex> lock(s_mtxManager);
-
-	// 去程管理器个数还没有达到最大值,则新建去程管理器
-	if (s_vecManager.size() < s_maxManager){
-
-		GoRoutineMgr* pManager = new(std::nothrow) GoRoutineMgr;
-
-		if (pManager != 0){
-
-			s_vecManager.push_back(pManager);
-
-			if (s_vecManager.size() == 1){
-				GoRoutine* pRoutine = pManager->start(fn);
-				if (pRoutine != 0){
-					lock.unlock();
-					pRoutine->start();
-				}
-			}else{
-				boost::thread managerThread(&GoRoutineMgr::start,pManager,fn);
-			}
-		}
-	}else{
-		// 在已有的去程管理器中增加一个去程
-		GoRoutineMgr* pManager = s_vecManager[s_nxtManager];
-		s_nxtManager = (s_nxtManager + 1) % s_maxManager;
-		pManager->add(fn);
+	GoRoutineMgr* pManager = GoRoutineMgr::createInstance();
+	if (pManager != 0){
+		pManager->createRoutine(fn);
 	}
 }
 
-GoRoutine* GoRoutineMgr::start(const GoRoutine::Go_Routine_Func& fn){
-	return this->create(fn,false);
+GoRoutineMgr* GoRoutineMgr::createInstance(){
+
+	boost::unique_lock<boost::mutex> lock(s_mtxManager);
+
+	GoRoutineMgr* pManager = s_pManager;
+
+	if (pManager == 0){
+		pManager = new(std::nothrow) GoRoutineMgr;
+		if ((pManager != 0) && (pManager->m_fiber_addr != 0)){
+			s_pManager = pManager;
+		}else{
+			delete pManager;
+			pManager = 0;
+		}
+	}
+
+	return pManager;
 }
 
-void GoRoutineMgr::add(const GoRoutine::Go_Routine_Func& fn){
-	this->create(fn,true);
-}
-
-GoRoutine* GoRoutineMgr::create(const GoRoutine::Go_Routine_Func& fn,bool newFiber){
+void GoRoutineMgr::createRoutine(const GoRoutine::Go_Routine_Func& fn){
 
 	// 创建一个去程
 	GoRoutine* pRoutine = new(std::nothrow) GoRoutine(fn);
 
 	if (pRoutine == 0){
-		return (GoRoutine*)0;
+		return;
 	}
 
 	// 创建用以模拟去程的纤程
-	void* fiber_addr;
-
-	if (newFiber){
-		fiber_addr = CreateFiber(0,GoRoutine::go,pRoutine);
-	}else{
-		fiber_addr = ConvertThreadToFiber(pRoutine);
-	}
+	void *fiber_addr = CreateFiber(0,GoRoutine::go,pRoutine);
 
 	if (fiber_addr != 0){
+
 		pRoutine->m_fiber_addr = fiber_addr;
 		pRoutine->m_mgr = this;
-		m_mtxList.lock();
+
+		boost::unique_lock<boost::mutex> lock(m_mtxList);
 		m_listRoutine.push_back(pRoutine);
-		m_mtxList.unlock();
-		return pRoutine;
+
+		// 如果是第一个goroutine,则启动调度过程
+		if (m_listRoutine.size() == 1){
+			lock.unlock();
+			scheduleproc();
+		}
 	}else{
 		delete pRoutine;
-		return (GoRoutine*)0;
 	}
 }
 
 //---------------------------- 执行调度 --------------------------------------
 
+GoRoutineMgr::GoRoutineMgr(){
+	m_fiber_addr = ConvertThreadToFiber(this);
+	m_toErase = 0;
+}
+
+GoRoutineMgr::~GoRoutineMgr(){
+	if (m_fiber_addr != 0){
+		DeleteFiber(m_fiber_addr);
+	}
+}
+
 void GoRoutineMgr::schedule(GoRoutine* pToErase/*=0*/){
+	m_toErase = pToErase;
+	SwitchToFiber(this->m_fiber_addr);// 切换到调度纤程
+}
+
+void GoRoutineMgr::scheduleproc(){
+
+	boost::random::mt19937 random_engine;
+	random_engine.seed(GetTickCount());
+
 	boost::unique_lock<boost::mutex> lock(m_mtxList);
-	if (pToErase != 0){
-		this->remove(pToErase);
+
+	while(m_listRoutine.size() > 0){
+		// 删除已经完成的纤程
+		if (m_toErase != 0){
+			this->remove(m_toErase);
+			m_toErase = 0;
+		}
+		// 随机切换到某个其他纤程
+		if (m_listRoutine.size() > 0){
+			GoRoutine* pRoutine = this->randomSwitch(random_engine);
+			lock.unlock();
+			SwitchToFiber(pRoutine->m_fiber_addr);
+			lock.lock();
+		}
 	}
-	if (m_listRoutine.empty()){
-		lock.unlock();
-		this->deleteMe();
-	}else{
-		GoRoutine* pRoutine = this->randomSwitch();
-		lock.unlock();
-		SwitchToFiber(pRoutine->m_fiber_addr);
-	}
+
+	delete this;
 }
 
 // 删除一个Goroutine
@@ -118,40 +116,11 @@ void GoRoutineMgr::remove(GoRoutine* pToErase){
 	}
 }
 
-// 删除Routine管理器
-void GoRoutineMgr::deleteMe(){
-
-	boost::unique_lock<boost::mutex> lock(s_mtxManager);
-
-	std::vector<GoRoutineMgr*>::iterator itor = s_vecManager.begin();
-
-	for(; itor != s_vecManager.end(); ++itor){
-		if (*itor == this){
-			s_vecManager.erase(itor);
-			break;
-		}
-	}
-
-	delete this;
-
-	if (s_vecManager.empty()){
-		// 所有去程管理器已经销毁,则程序退出
-		lock.unlock();
-		ExitProcess(0);
-	}else{
-		// 当前去程管理器已经销毁,退出所使用的操作系统线程
-		lock.unlock();
-		ExitThread(0);
-	}
-}
-
 // 随机切换到一个就绪状态的goroutine
-GoRoutine* GoRoutineMgr::randomSwitch(){
+GoRoutine* GoRoutineMgr::randomSwitch(boost::random::mt19937& random_engine){
 
 	int cnt = int(m_listRoutine.size());
-	boost::random::mt19937 random_engine;
 	boost::random::uniform_int_distribution<> random_int(0,cnt);
-	random_engine.seed(GetTickCount());
 
 	int waitcnt = 0,readycnt = 0;
 
@@ -206,6 +175,7 @@ GoRoutine::GoRoutine(const Go_Routine_Func& fn){
 }
 
 GoRoutine::~GoRoutine(){
+	DeleteFiber(this->m_fiber_addr);
 }
 
 void WINAPI GoRoutine::go(void* p){
